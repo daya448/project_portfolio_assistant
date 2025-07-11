@@ -434,6 +434,61 @@ class LangGraphElasticsearchAgent:
             logger.error(f"Get sample doc error: {e}")
             return None
 
+    async def _build_contextual_step_query(self, current_step: dict, original_query: str, analysis: QueryAnalysis, state: AgentState, step_count: int) -> str:
+        """Build a context-aware query for the current step using results from previous steps"""
+        
+        # If this is the first step, use the original query
+        if step_count == 0:
+            return original_query
+        
+        # Get previous search results
+        previous_results = state.get("search_results", [])
+        if not previous_results:
+            return original_query
+        
+        # Build context from previous steps
+        context_prompt = f"""
+        Build a specific search query for this step based on previous results:
+        
+        Original Query: {original_query}
+        Current Step: {current_step['description']}
+        Step Number: {step_count + 1}
+        
+        Previous Search Results:
+        {json.dumps(previous_results, indent=2)}
+        
+        Instructions:
+        - Use information from previous steps to make this query more specific and targeted
+        - Extract key terms, entity names, IDs, or other identifiers from previous results
+        - Build upon the context established in previous steps
+        - Make the query more focused based on what was discovered
+        
+        **General Approach:**
+        - If previous step found entities: Use those entity names/IDs in the current query
+        - If previous step found categories: Filter by those categories
+        - If previous step found time periods: Use those time constraints
+        - If previous step found properties: Search for related properties or details
+        - Always make the query more specific than the original, using context from previous steps
+        
+        Return ONLY the search query string, nothing else.
+        """
+        
+        try:
+            messages = [SystemMessage(content=context_prompt)]
+            response = await self.llm.ainvoke(messages)
+            contextual_query = response.content.strip()
+            
+            # Clean up the response
+            if contextual_query.startswith('"') and contextual_query.endswith('"'):
+                contextual_query = contextual_query[1:-1]
+            
+            logger.info(f"Built contextual query for step {step_count + 1}: {contextual_query}")
+            return contextual_query
+            
+        except Exception as e:
+            logger.error(f"Error building contextual query: {e}")
+            return original_query
+
     # Node implementations
     async def _analyze_query_node(self, state: AgentState) -> AgentState:
         """Analyze the user query to understand intent and requirements"""
@@ -458,11 +513,41 @@ Analyze this Elasticsearch query request:
 
 User Query: {query}
 
+**MULTI-STEP ANALYSIS GUIDELINES:**
+Set requires_multi_step to TRUE if the query involves ANY of these characteristics:
+
+**Pattern-Based Detection:**
+- "summarize from all projects" or "summarize across projects"
+- "what we have done" or "work done" or "accomplishments" 
+- "compare" or "comparison" between different entities
+- "find all" + "then" + another action
+- "list" + "and" + "analyze" or "summarize"
+
+**General Complexity Detection:**
+- Queries requiring data gathering followed by analysis/synthesis
+- Queries with multiple distinct information needs or sub-questions
+- Queries that need to find entities first, then analyze their properties
+- Queries involving aggregation across multiple entities or categories
+- Queries requiring sequential reasoning (find X, then analyze Y based on X)
+- Queries with temporal or hierarchical relationships (timeline, phases, categories)
+- Queries needing to combine information from different sources or perspectives
+- Queries requiring both search and analysis phases
+
+**Decision Framework:**
+Ask yourself: "Can this query be answered with a single search, or does it need multiple steps?"
+- Single search: Direct lookup, simple filtering, basic aggregation
+- Multiple steps: Find entities → analyze properties → synthesize results
+
+**COMPLEXITY GUIDELINES:**
+- simple: Single search term, direct lookup
+- moderate: Multiple search terms, filtering, basic aggregation
+- complex: Multi-step reasoning, data gathering + analysis, comparisons, summarization
+
 Determine:
 1. intent: What is the user trying to find/analyze?
 2. complexity: simple, moderate, or complex
 3. requires_aggregation: Does this need aggregations/analytics?
-4. requires_multi_step: Does this need multiple searches?
+4. requires_multi_step: Does this need multiple searches? (Use guidelines above)
 5. elasticsearch_strategy: What ES approach is best?
 6. confidence: How confident are you in this analysis?
 7. key_concepts: Extract the main concepts
@@ -534,12 +619,41 @@ Return ONLY a valid JSON object with these fields.
             Query: {query}
             Analysis: {json.dumps(analysis, indent=2)}
             
+            **GENERAL MULTI-STEP PLANNING PRINCIPLES:**
+            
+            **Step 1: Data Discovery/Gathering**
+            - Find relevant entities, projects, or categories
+            - Identify the scope of data needed
+            - Use broad search to understand what's available
+            
+            **Step 2: Data Extraction/Analysis**
+            - Extract specific properties, metrics, or details from discovered entities
+            - Filter, aggregate, or analyze the gathered data
+            - Focus on the specific information requested
+            
+            **Step 3: Synthesis/Comparison**
+            - Combine results from previous steps
+            - Compare, summarize, or synthesize findings
+            - Provide the final answer or insights
+            
+            **Adaptive Planning:**
+            - Analyze the query structure and identify natural breakpoints
+            - Consider what information needs to be gathered first
+            - Plan steps that build upon each other logically
+            - Ensure each step has a clear, specific purpose
+            
+            **Common Patterns:**
+            - Entity Discovery → Property Analysis → Synthesis
+            - Data Gathering → Aggregation → Summary
+            - Comparison Setup → Data Collection → Comparison Analysis
+            - Timeline Creation → Event Analysis → Trend Identification
+            
             Break this down into logical steps that can be executed sequentially.
             Each step should be a specific Elasticsearch operation.
             
             Return ONLY a valid JSON array of steps, each with:
             - step_number: int
-            - description: str
+            - description: str (be specific about what this step will search for)
             - action: str (search, aggregate, analyze, etc.)
             - query_needed: bool
             """
@@ -548,7 +662,16 @@ Return ONLY a valid JSON object with these fields.
             response = await self.llm.ainvoke(messages)
             
             try:
-                steps_data = json.loads(response.content)
+                # Extract JSON from markdown code blocks if present
+                content = response.content.strip()
+                if content.startswith('```json'):
+                    content = content[7:]  # Remove ```json
+                if content.startswith('```'):
+                    content = content[3:]  # Remove ```
+                if content.endswith('```'):
+                    content = content[:-3]  # Remove ```
+                
+                steps_data = json.loads(content.strip())
                 reasoning_steps = [ReasoningStep(**step) for step in steps_data]
                 state["reasoning_steps"] = [step.model_dump() for step in reasoning_steps]
                 
@@ -590,17 +713,22 @@ Return ONLY a valid JSON object with these fields.
         logger.info(f"Executing step {step_count + 1}: {current_step['description']}")
         
         if current_step["query_needed"]:
-            # Build and execute query
+            # Build and execute query with context from previous steps
             query = state.get("contextualized_query", state["query"])
             analysis = QueryAnalysis(**state["query_analysis"])
+            
+            # Build context-aware query based on previous results
+            step_query = await self._build_contextual_step_query(
+                current_step, query, analysis, state, step_count
+            )
             
             # Use the correct index for project portfolio context
             import os
             index_name = os.getenv("ELASTICSEARCH_INDEX_NAME", "text_project_portfolio")
             if current_step["action"] == "aggregate":
-                es_query = await self.query_builder.build_aggregation_query(query, analysis, index_name)
+                es_query = await self.query_builder.build_aggregation_query(step_query, analysis, index_name)
             else:
-                es_query = await self.query_builder.build_search_query(query, analysis, index_name)
+                es_query = await self.query_builder.build_search_query(step_query, analysis, index_name)
             
             # Execute the query
             search_result = await self._elasticsearch_search(index_name, es_query.query_body)
@@ -660,7 +788,7 @@ Return ONLY a valid JSON object with these fields.
         logger.info(f"Synthesizing answer for query: {query}")
         
         synthesis_prompt = f"""
-        Synthesize a comprehensive answer based on the search results:
+        Synthesize a comprehensive answer based on the multi-step search results:
         
         Original Query: {query}
         
@@ -668,14 +796,34 @@ Return ONLY a valid JSON object with these fields.
         
         Search Results: {json.dumps(search_results, indent=2)}
         
-        Provide a clear, comprehensive answer that:
-        1. Directly addresses the user's query
-        2. Incorporates insights from the search results
-        3. Explains any patterns or trends found
-        4. Acknowledges limitations if data is incomplete
-        5. Suggests follow-up questions if relevant
+        **MULTI-STEP SYNTHESIS GUIDELINES:**
         
-        Be conversational but informative.
+        For "summarize from all projects" queries:
+        - Step 1 typically finds projects matching criteria
+        - Step 2 extracts work/accomplishments from those projects
+        - Step 3 synthesizes the findings into a comprehensive summary
+        
+        For "what we have done" queries:
+        - Step 1 finds relevant entities/projects
+        - Step 2 extracts accomplishments and work done
+        - Step 3 summarizes the work and achievements
+        
+        For comparison queries:
+        - Step 1 gathers data for first entity
+        - Step 2 gathers data for second entity
+        - Step 3 compares and analyzes differences
+        
+        **SYNTHESIS INSTRUCTIONS:**
+        1. Follow the logical flow of the execution steps
+        2. Use results from each step to build a coherent narrative
+        3. For project summaries: List projects found, then summarize work done across those projects
+        4. For comparisons: Present data for each entity, then highlight key differences
+        5. For work summaries: Identify entities/projects, then summarize accomplishments
+        6. Acknowledge if any steps returned limited or no results
+        7. Suggest follow-up questions based on the findings
+        
+        Provide a clear, comprehensive answer that directly addresses the user's query.
+        Be conversational but informative, and structure the response logically.
         """
         
         messages = [SystemMessage(content=synthesis_prompt)]
